@@ -1559,6 +1559,15 @@ impl BountyEscrowContract {
             return Err(Error::FundsNotLocked);
         }
 
+        // Defense in depth: token transfer is an external call. Block nested
+        // entry into claim/release paths before interacting with the token.
+        if env.storage().instance().has(&DataKey::ReentrancyGuard) {
+            panic!("Reentrancy detected");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &true);
+
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
         client.transfer(
@@ -1598,6 +1607,7 @@ impl BountyEscrowContract {
                 claimed_at: now,
             },
         );
+        env.storage().instance().remove(&DataKey::ReentrancyGuard);
         Ok(())
     }
 
@@ -1777,6 +1787,15 @@ impl BountyEscrowContract {
             return Err(Error::InsufficientFunds);
         }
 
+        // Defense in depth: token transfer is an external call. Block nested
+        // entry into claim/release paths before interacting with the token.
+        if env.storage().instance().has(&DataKey::ReentrancyGuard) {
+            panic!("Reentrancy detected");
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::ReentrancyGuard, &true);
+
         let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
 
@@ -1818,6 +1837,7 @@ impl BountyEscrowContract {
             },
         );
 
+        env.storage().instance().remove(&DataKey::ReentrancyGuard);
         Ok(())
     }
 

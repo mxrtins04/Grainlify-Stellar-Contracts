@@ -1565,6 +1565,8 @@ impl BountyEscrowContract {
         );
         Ok(())
     }
+
+    /// Admin can cancel an expired or unwanted pending claim, returning escrow to Locked.
     pub fn cancel_pending_claim(env: Env, bounty_id: u64) -> Result<(), Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
@@ -2449,19 +2451,24 @@ impl BountyEscrowContract {
                 .persistent()
                 .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
             {
+                let mut refund_sum = 0i128;
+                for record in escrow.refund_history.iter() {
+                    refund_sum += record.amount;
+                }
+                let released_sum = escrow.amount - escrow.remaining_amount - refund_sum;
+
+                stats.total_released += released_sum;
+                stats.total_refunded += refund_sum;
+
                 match escrow.status {
                     EscrowStatus::Locked | EscrowStatus::PartiallyRefunded => {
                         stats.total_locked += escrow.remaining_amount;
                         stats.count_locked += 1;
                     }
                     EscrowStatus::Released => {
-                        stats.total_released += escrow.amount;
                         stats.count_released += 1;
                     }
                     EscrowStatus::Refunded => {
-                        // For refunded, we count the original amount in total_refunded
-                        // The actual refund amounts are tracked in refund_history
-                        stats.total_refunded += escrow.amount;
                         stats.count_refunded += 1;
                     }
                 }

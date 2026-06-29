@@ -205,6 +205,8 @@ const PROGRAM_REGISTERED: Symbol = symbol_short!("ProgRegd");
 const FEE_CONFIG: Symbol = symbol_short!("FeeConf");
 const FUND_CAP_CONFIG: Symbol = symbol_short!("FnCapCfg");
 const BASIS_POINTS: i128 = 10_000;
+const TTL_THRESHOLD: u32 = 17280;
+const TTL_EXTEND_TO: u32 = 518400;
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayoutRecord {
@@ -317,7 +319,9 @@ pub enum DataKey {
     RateLimitConfig,                 // RateLimitConfig struct
     FeeConfig,                       // FeeConfig struct
     ProgramRegistry,                 // Vec<String> of program IDs
-    Dispute,                         // DisputeRecord (program-level dispute)
+    Dispute,                         // DisputeRecord (global program-level dispute)
+    RecipientDispute(Address),       // recipient -> DisputeRecord
+    ScheduleDispute(u64),            // schedule_id -> DisputeRecord
 }
 
 #[contracttype]
@@ -443,6 +447,19 @@ pub enum DisputeStatus {
     Cancelled,
 }
 
+/// Scope for a dispute halt.
+///
+/// `Global` preserves the original program-wide dispute behavior. `Recipient`
+/// blocks direct payouts and releases for one recipient, while `Schedule`
+/// blocks only one release schedule.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeScope {
+    Global,
+    Recipient(Address),
+    Schedule(u64),
+}
+
 /// Record stored on-chain for an active or historical dispute.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -462,6 +479,7 @@ pub struct DisputeRecord {
 pub struct DisputeOpenedEvent {
     pub version: u32,
     pub program_id: String,
+    pub scope: DisputeScope,
     pub opened_by: Address,
     pub reason: String,
     pub timestamp: u64,
@@ -472,6 +490,7 @@ pub struct DisputeOpenedEvent {
 pub struct DisputeResolvedEvent {
     pub version: u32,
     pub program_id: String,
+    pub scope: DisputeScope,
     pub resolved_by: Address,
     pub timestamp: u64,
 }
@@ -481,6 +500,7 @@ pub struct DisputeResolvedEvent {
 pub struct DisputeCancelledEvent {
     pub version: u32,
     pub program_id: String,
+    pub scope: DisputeScope,
     pub cancelled_by: Address,
     pub timestamp: u64,
 }
@@ -559,7 +579,8 @@ impl ProgramEscrowContract {
         token_address: Address,
     ) -> ProgramData {
         // Check if program already exists
-        if env.storage().instance().has(&PROGRAM_DATA) {
+        if env.storage().persistent().has(&PROGRAM_DATA) {
+            Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
             panic!("Program already initialized");
         }
 
@@ -573,13 +594,16 @@ impl ProgramEscrowContract {
         };
 
         // Store program data
-        env.storage().instance().set(&PROGRAM_DATA, &program_data);
+        env.storage().persistent().set(&PROGRAM_DATA, &program_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         env.storage()
-            .instance()
+            .persistent()
             .set(&SCHEDULES, &Vec::<ProgramReleaseSchedule>::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         env.storage()
-            .instance()
+            .persistent()
             .set(&RELEASE_HISTORY, &Vec::<ProgramReleaseHistory>::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
         env.storage().instance().set(&NEXT_SCHEDULE_ID, &1_u64);
 
         // Emit ProgramInitialized event
@@ -620,7 +644,8 @@ impl ProgramEscrowContract {
         }
         for i in 0..batch_size {
             let program_key = DataKey::Program(items.get(i).unwrap().program_id.clone());
-            if env.storage().instance().has(&program_key) {
+            if env.storage().persistent().has(&program_key) {
+                Self::bump_persistent_datakey_ttl(&env, &program_key);
                 return Err(BatchError::ProgramAlreadyExists);
             }
         }
@@ -645,7 +670,8 @@ impl ProgramEscrowContract {
                 token_address: token_address.clone(),
             };
             let program_key = DataKey::Program(program_id.clone());
-            env.storage().instance().set(&program_key, &program_data);
+            env.storage().persistent().set(&program_key, &program_data);
+            Self::bump_persistent_datakey_ttl(&env, &program_key);
 
             env.events().publish(
                 (symbol_short!("BatchReg"),),
@@ -669,6 +695,16 @@ impl ProgramEscrowContract {
             .unwrap_or(0)
     }
 
+    /// Bump the TTL for single-program persistent storage keys
+    fn bump_persistent_symbol_ttl(env: &Env, key: &Symbol) {
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
+    /// Bump the TTL for multi-program persistent storage keys
+    fn bump_persistent_datakey_ttl(env: &Env, key: &DataKey) {
+        env.storage().persistent().extend_ttl(key, TTL_THRESHOLD, TTL_EXTEND_TO);
+    }
+
     /// Get fee configuration (internal helper)
     fn get_fee_config_internal(env: &Env) -> FeeConfig {
         env.storage()
@@ -686,9 +722,10 @@ impl ProgramEscrowContract {
     fn emit_aggregate_stats(env: &Env, program_data: &ProgramData) {
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(env));
+        Self::bump_persistent_symbol_ttl(env, &SCHEDULES);
 
         let mut scheduled_count = 0u32;
         for i in 0..schedules.len() {
@@ -738,7 +775,8 @@ impl ProgramEscrowContract {
     /// * `bool` - True if program exists, false otherwise
     pub fn program_exists(env: Env) -> bool {
         // Check both PROGRAM_DATA (single program) and DataKey::Program registry
-        if env.storage().instance().has(&PROGRAM_DATA) {
+        if env.storage().persistent().has(&PROGRAM_DATA) {
+            Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
             return true;
         }
         // Check if any programs exist in registry
@@ -778,9 +816,10 @@ impl ProgramEscrowContract {
 
         let mut program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         // Check fund caps if configured
         let cap_config: FundCapConfig = env
@@ -828,7 +867,8 @@ impl ProgramEscrowContract {
         }
 
         // Store updated data
-        env.storage().instance().set(&PROGRAM_DATA, &program_data);
+        env.storage().persistent().set(&PROGRAM_DATA, &program_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         // Emit FundsLocked event
         env.events().publish(
@@ -963,17 +1003,137 @@ impl ProgramEscrowContract {
             .unwrap_or_else(|| panic!("Admin not set"))
     }
 
-    /// Internal guard — panics if a dispute is currently open.
-    fn check_not_disputed(env: &Env) {
-        if let Some(record) = env
+    /// Returns true when the given dispute key currently stores an open dispute.
+    fn is_dispute_open_for_key(env: &Env, key: &DataKey) -> bool {
+        if let Some(record) = env.storage().instance().get::<DataKey, DisputeRecord>(key) {
+            record.status == DisputeStatus::Open
+        } else {
+            false
+        }
+    }
+
+    /// Returns true when a due schedule should be skipped by scoped dispute handling.
+    fn is_schedule_scope_disputed(env: &Env, schedule_id: u64, recipient: &Address) -> bool {
+        Self::is_dispute_open_for_key(env, &DataKey::ScheduleDispute(schedule_id))
+            || Self::is_dispute_open_for_key(env, &DataKey::RecipientDispute(recipient.clone()))
+    }
+
+    fn program_id_for_event(env: &Env) -> String {
+        let program_data: ProgramData = env
+            .storage()
+            .persistent()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
+        program_data.program_id
+    }
+
+    fn open_dispute_at(
+        env: &Env,
+        key: DataKey,
+        scope: DisputeScope,
+        reason: String,
+        duplicate_message: &str,
+    ) {
+        let admin = Self::requireadmin(env);
+        admin.require_auth();
+
+        if Self::is_dispute_open_for_key(env, &key) {
+            panic!("{}", duplicate_message);
+        }
+
+        let program_id = Self::program_id_for_event(env);
+        let now = env.ledger().timestamp();
+        let record = DisputeRecord {
+            opened_by: admin.clone(),
+            opened_at: now,
+            reason: reason.clone(),
+            status: DisputeStatus::Open,
+            resolved_by: None,
+            resolved_at: None,
+        };
+
+        env.storage().instance().set(&key, &record);
+
+        env.events().publish(
+            (DISPUTE_OPENED,),
+            DisputeOpenedEvent {
+                version: EVENT_VERSION_V2,
+                program_id,
+                scope,
+                opened_by: admin,
+                reason,
+                timestamp: now,
+            },
+        );
+    }
+
+    fn resolve_dispute_at(env: &Env, key: DataKey, scope: DisputeScope, missing_message: &str) {
+        let admin = Self::requireadmin(env);
+        admin.require_auth();
+
+        let mut record: DisputeRecord = env
             .storage()
             .instance()
-            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
-        {
-            if record.status == DisputeStatus::Open {
-                panic!("Dispute in progress");
-            }
+            .get(&key)
+            .unwrap_or_else(|| panic!("{}", missing_message));
+
+        if record.status != DisputeStatus::Open {
+            panic!("No open dispute to resolve");
         }
+
+        let program_id = Self::program_id_for_event(env);
+        let now = env.ledger().timestamp();
+        record.status = DisputeStatus::Resolved;
+        record.resolved_by = Some(admin.clone());
+        record.resolved_at = Some(now);
+
+        env.storage().instance().set(&key, &record);
+
+        env.events().publish(
+            (DISPUTE_RESOLVED,),
+            DisputeResolvedEvent {
+                version: EVENT_VERSION_V2,
+                program_id,
+                scope,
+                resolved_by: admin,
+                timestamp: now,
+            },
+        );
+    }
+
+    fn cancel_dispute_at(env: &Env, key: DataKey, scope: DisputeScope, missing_message: &str) {
+        let admin = Self::requireadmin(env);
+        admin.require_auth();
+
+        let mut record: DisputeRecord = env
+            .storage()
+            .instance()
+            .get(&key)
+            .unwrap_or_else(|| panic!("{}", missing_message));
+
+        if record.status != DisputeStatus::Open {
+            panic!("No open dispute to cancel");
+        }
+
+        let program_id = Self::program_id_for_event(env);
+        let now = env.ledger().timestamp();
+        record.status = DisputeStatus::Cancelled;
+        record.resolved_by = Some(admin.clone());
+        record.resolved_at = Some(now);
+
+        env.storage().instance().set(&key, &record);
+
+        env.events().publish(
+            (DISPUTE_CANCELLED,),
+            DisputeCancelledEvent {
+                version: EVENT_VERSION_V2,
+                program_id,
+                scope,
+                cancelled_by: admin,
+                timestamp: now,
+            },
+        );
     }
 
     /// Open a dispute on this program, blocking further payouts until resolved or cancelled.
@@ -985,47 +1145,40 @@ impl ProgramEscrowContract {
     /// * If admin not set
     /// * If a dispute is already open
     pub fn open_dispute(env: Env, reason: String) {
-        let admin = Self::requireadmin(&env);
-        admin.require_auth();
+        Self::open_dispute_at(
+            &env,
+            DataKey::Dispute,
+            DisputeScope::Global,
+            reason,
+            "Dispute already open",
+        );
+    }
 
-        // Reject if a dispute is already open
-        if let Some(existing) = env
-            .storage()
-            .instance()
-            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
-        {
-            if existing.status == DisputeStatus::Open {
-                panic!("Dispute already open");
-            }
-        }
+    /// Open a recipient-scoped dispute.
+    ///
+    /// Direct payouts and release schedules for this recipient are blocked,
+    /// while unrelated recipients remain payable unless a global dispute is open.
+    pub fn open_recipient_dispute(env: Env, recipient: Address, reason: String) {
+        Self::open_dispute_at(
+            &env,
+            DataKey::RecipientDispute(recipient.clone()),
+            DisputeScope::Recipient(recipient),
+            reason,
+            "Recipient dispute already open",
+        );
+    }
 
-        let program_data: ProgramData = env
-            .storage()
-            .instance()
-            .get(&PROGRAM_DATA)
-            .unwrap_or_else(|| panic!("Program not initialized"));
-
-        let now = env.ledger().timestamp();
-        let record = DisputeRecord {
-            opened_by: admin.clone(),
-            opened_at: now,
-            reason: reason.clone(),
-            status: DisputeStatus::Open,
-            resolved_by: None,
-            resolved_at: None,
-        };
-
-        env.storage().instance().set(&DataKey::Dispute, &record);
-
-        env.events().publish(
-            (DISPUTE_OPENED,),
-            DisputeOpenedEvent {
-                version: EVENT_VERSION_V2,
-                program_id: program_data.program_id.clone(),
-                opened_by: admin,
-                reason,
-                timestamp: now,
-            },
+    /// Open a schedule-scoped dispute.
+    ///
+    /// Only the selected release schedule is blocked unless a global or
+    /// recipient-scoped dispute also applies.
+    pub fn open_schedule_dispute(env: Env, schedule_id: u64, reason: String) {
+        Self::open_dispute_at(
+            &env,
+            DataKey::ScheduleDispute(schedule_id),
+            DisputeScope::Schedule(schedule_id),
+            reason,
+            "Schedule dispute already open",
         );
     }
 
@@ -1035,40 +1188,31 @@ impl ProgramEscrowContract {
     /// * If admin not set
     /// * If no dispute is currently open
     pub fn resolve_dispute(env: Env) {
-        let admin = Self::requireadmin(&env);
-        admin.require_auth();
+        Self::resolve_dispute_at(
+            &env,
+            DataKey::Dispute,
+            DisputeScope::Global,
+            "No dispute to resolve",
+        );
+    }
 
-        let mut record: DisputeRecord = env
-            .storage()
-            .instance()
-            .get(&DataKey::Dispute)
-            .unwrap_or_else(|| panic!("No dispute to resolve"));
+    /// Resolve an open recipient-scoped dispute.
+    pub fn resolve_recipient_dispute(env: Env, recipient: Address) {
+        Self::resolve_dispute_at(
+            &env,
+            DataKey::RecipientDispute(recipient.clone()),
+            DisputeScope::Recipient(recipient),
+            "No recipient dispute to resolve",
+        );
+    }
 
-        if record.status != DisputeStatus::Open {
-            panic!("No open dispute to resolve");
-        }
-
-        let program_data: ProgramData = env
-            .storage()
-            .instance()
-            .get(&PROGRAM_DATA)
-            .unwrap_or_else(|| panic!("Program not initialized"));
-
-        let now = env.ledger().timestamp();
-        record.status = DisputeStatus::Resolved;
-        record.resolved_by = Some(admin.clone());
-        record.resolved_at = Some(now);
-
-        env.storage().instance().set(&DataKey::Dispute, &record);
-
-        env.events().publish(
-            (DISPUTE_RESOLVED,),
-            DisputeResolvedEvent {
-                version: EVENT_VERSION_V2,
-                program_id: program_data.program_id.clone(),
-                resolved_by: admin,
-                timestamp: now,
-            },
+    /// Resolve an open schedule-scoped dispute.
+    pub fn resolve_schedule_dispute(env: Env, schedule_id: u64) {
+        Self::resolve_dispute_at(
+            &env,
+            DataKey::ScheduleDispute(schedule_id),
+            DisputeScope::Schedule(schedule_id),
+            "No schedule dispute to resolve",
         );
     }
 
@@ -1078,40 +1222,31 @@ impl ProgramEscrowContract {
     /// * If admin not set
     /// * If no dispute is currently open
     pub fn cancel_dispute(env: Env) {
-        let admin = Self::requireadmin(&env);
-        admin.require_auth();
+        Self::cancel_dispute_at(
+            &env,
+            DataKey::Dispute,
+            DisputeScope::Global,
+            "No dispute to cancel",
+        );
+    }
 
-        let mut record: DisputeRecord = env
-            .storage()
-            .instance()
-            .get(&DataKey::Dispute)
-            .unwrap_or_else(|| panic!("No dispute to cancel"));
+    /// Cancel an open recipient-scoped dispute.
+    pub fn cancel_recipient_dispute(env: Env, recipient: Address) {
+        Self::cancel_dispute_at(
+            &env,
+            DataKey::RecipientDispute(recipient.clone()),
+            DisputeScope::Recipient(recipient),
+            "No recipient dispute to cancel",
+        );
+    }
 
-        if record.status != DisputeStatus::Open {
-            panic!("No open dispute to cancel");
-        }
-
-        let program_data: ProgramData = env
-            .storage()
-            .instance()
-            .get(&PROGRAM_DATA)
-            .unwrap_or_else(|| panic!("Program not initialized"));
-
-        let now = env.ledger().timestamp();
-        record.status = DisputeStatus::Cancelled;
-        record.resolved_by = Some(admin.clone());
-        record.resolved_at = Some(now);
-
-        env.storage().instance().set(&DataKey::Dispute, &record);
-
-        env.events().publish(
-            (DISPUTE_CANCELLED,),
-            DisputeCancelledEvent {
-                version: EVENT_VERSION_V2,
-                program_id: program_data.program_id.clone(),
-                cancelled_by: admin,
-                timestamp: now,
-            },
+    /// Cancel an open schedule-scoped dispute.
+    pub fn cancel_schedule_dispute(env: Env, schedule_id: u64) {
+        Self::cancel_dispute_at(
+            &env,
+            DataKey::ScheduleDispute(schedule_id),
+            DisputeScope::Schedule(schedule_id),
+            "No schedule dispute to cancel",
         );
     }
 
@@ -1120,17 +1255,33 @@ impl ProgramEscrowContract {
         env.storage().instance().get(&DataKey::Dispute)
     }
 
+    /// Returns the current recipient-scoped dispute record, if any.
+    pub fn get_recipient_dispute(env: Env, recipient: Address) -> Option<DisputeRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::RecipientDispute(recipient))
+    }
+
+    /// Returns the current schedule-scoped dispute record, if any.
+    pub fn get_schedule_dispute(env: Env, schedule_id: u64) -> Option<DisputeRecord> {
+        env.storage()
+            .instance()
+            .get(&DataKey::ScheduleDispute(schedule_id))
+    }
+
     /// Returns true if a dispute is currently open.
     pub fn is_disputed(env: Env) -> bool {
-        if let Some(record) = env
-            .storage()
-            .instance()
-            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
-        {
-            record.status == DisputeStatus::Open
-        } else {
-            false
-        }
+        Self::is_dispute_open_for_key(&env, &DataKey::Dispute)
+    }
+
+    /// Returns true if a recipient-scoped dispute is currently open.
+    pub fn is_recipient_disputed(env: Env, recipient: Address) -> bool {
+        Self::is_dispute_open_for_key(&env, &DataKey::RecipientDispute(recipient))
+    }
+
+    /// Returns true if a schedule-scoped dispute is currently open.
+    pub fn is_schedule_disputed(env: Env, schedule_id: u64) -> bool {
+        Self::is_dispute_open_for_key(&env, &DataKey::ScheduleDispute(schedule_id))
     }
 
     // --- Circuit Breaker & Rate Limit ---
@@ -1394,21 +1545,21 @@ impl ProgramEscrowContract {
             panic!("Funds Paused");
         }
 
-        // Dispute guard: block payouts while a dispute is open
-        if Self::is_disputed(env.clone()) {
+        // Global dispute guard: block all payouts while a global dispute is open.
+        if Self::is_dispute_open_for_key(&env, &DataKey::Dispute) {
             reentrancy_guard::clear_entered(&env);
             panic!("Dispute in progress");
         }
 
-        // Verify authorization
         let mut program_data: ProgramData =
             env.storage()
-                .instance()
+                .persistent()
                 .get(&PROGRAM_DATA)
                 .unwrap_or_else(|| {
                     reentrancy_guard::clear_entered(&env);
                     panic!("Program not initialized")
                 });
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         program_data.authorized_payout_key.require_auth();
 
@@ -1429,6 +1580,13 @@ impl ProgramEscrowContract {
         if recipient_count > MAX_BATCH_SIZE {
             reentrancy_guard::clear_entered(&env);
             panic!("Batch size exceeds maximum allowed");
+        }
+
+        for recipient in recipients.iter() {
+            if Self::is_dispute_open_for_key(&env, &DataKey::RecipientDispute(recipient)) {
+                reentrancy_guard::clear_entered(&env);
+                panic!("Dispute in progress");
+            }
         }
 
         // Calculate total payout amount
@@ -1507,7 +1665,8 @@ impl ProgramEscrowContract {
             });
 
         // Store updated data
-        env.storage().instance().set(&PROGRAM_DATA, &program_data);
+        env.storage().persistent().set(&PROGRAM_DATA, &program_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         // Emit BatchPayout event
         env.events().publish(
@@ -1571,8 +1730,11 @@ impl ProgramEscrowContract {
             panic!("Funds Paused");
         }
 
-        // Dispute guard: block payouts while a dispute is open
-        if Self::is_disputed(env.clone()) {
+        // Dispute guard: global disputes block all payouts; recipient disputes
+        // block only this payout target.
+        if Self::is_dispute_open_for_key(&env, &DataKey::Dispute)
+            || Self::is_dispute_open_for_key(&env, &DataKey::RecipientDispute(recipient.clone()))
+        {
             reentrancy_guard::clear_entered(&env);
             panic!("Dispute in progress");
         }
@@ -1580,12 +1742,13 @@ impl ProgramEscrowContract {
         // Verify authorization
         let program_data: ProgramData =
             env.storage()
-                .instance()
+                .persistent()
                 .get(&PROGRAM_DATA)
                 .unwrap_or_else(|| {
                     reentrancy_guard::clear_entered(&env);
                     panic!("Program not initialized")
                 });
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         program_data.authorized_payout_key.require_auth();
 
@@ -1635,7 +1798,8 @@ impl ProgramEscrowContract {
         updated_data.payout_history = updated_history;
 
         // Store updated data
-        env.storage().instance().set(&PROGRAM_DATA, &updated_data);
+        env.storage().persistent().set(&PROGRAM_DATA, &updated_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         // Emit Payout event
         env.events().publish(
@@ -1674,10 +1838,12 @@ impl ProgramEscrowContract {
     /// # Returns
     /// ProgramData containing all program information
     pub fn get_program_info(env: Env) -> ProgramData {
-        env.storage()
-            .instance()
+        let val = env.storage()
+            .persistent()
             .get(&PROGRAM_DATA)
-            .unwrap_or_else(|| panic!("Program not initialized"))
+            .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
+        val
     }
 
     /// Get remaining balance
@@ -1687,9 +1853,10 @@ impl ProgramEscrowContract {
     pub fn get_remaining_balance(env: Env) -> i128 {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         program_data.remaining_balance
     }
@@ -1703,9 +1870,10 @@ impl ProgramEscrowContract {
     ) -> ProgramReleaseSchedule {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         program_data.authorized_payout_key.require_auth();
 
@@ -1715,9 +1883,10 @@ impl ProgramEscrowContract {
 
         let mut schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let schedule_id: u64 = env
             .storage()
             .instance()
@@ -1735,7 +1904,8 @@ impl ProgramEscrowContract {
         };
         schedules.push_back(schedule.clone());
 
-        env.storage().instance().set(&SCHEDULES, &schedules);
+        env.storage().persistent().set(&SCHEDULES, &schedules);
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         env.storage()
             .instance()
             .set(&NEXT_SCHEDULE_ID, &(schedule_id + 1));
@@ -1755,32 +1925,35 @@ impl ProgramEscrowContract {
             panic!("Circuit breaker open: schedule releases temporarily disabled");
         }
 
-        // Dispute guard: block schedule releases while a dispute is open
-        if Self::is_disputed(env.clone()) {
+        // Global dispute guard: block all schedule releases while a global dispute is open.
+        if Self::is_dispute_open_for_key(&env, &DataKey::Dispute) {
             reentrancy_guard::clear_entered(&env);
             panic!("Dispute in progress");
         }
 
         let mut program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| {
                 reentrancy_guard::clear_entered(&env);
                 panic!("Program not initialized")
             });
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         program_data.authorized_payout_key.require_auth();
 
         let mut schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let mut release_history: Vec<ProgramReleaseHistory> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&RELEASE_HISTORY)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
 
         let now = env.ledger().timestamp();
         let contract_address = env.current_contract_address();
@@ -1796,6 +1969,10 @@ impl ProgramEscrowContract {
 
             let mut schedule = schedules.get(i).unwrap();
             if schedule.released || now < schedule.release_timestamp {
+                continue;
+            }
+
+            if Self::is_schedule_scope_disputed(&env, schedule.schedule_id, &schedule.recipient) {
                 continue;
             }
 
@@ -1846,11 +2023,14 @@ impl ProgramEscrowContract {
             released_count += 1;
         }
 
-        env.storage().instance().set(&PROGRAM_DATA, &program_data);
-        env.storage().instance().set(&SCHEDULES, &schedules);
+        env.storage().persistent().set(&PROGRAM_DATA, &program_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
+        env.storage().persistent().set(&SCHEDULES, &schedules);
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         env.storage()
-            .instance()
+            .persistent()
             .set(&RELEASE_HISTORY, &release_history);
+        Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
 
         // Inform the circuit breaker of the outcome.
         if released_count > 0 {
@@ -1865,17 +2045,21 @@ impl ProgramEscrowContract {
     }
 
     pub fn get_program_release_schedules(env: Env) -> Vec<ProgramReleaseSchedule> {
-        env.storage()
-            .instance()
+        let val = env.storage()
+            .persistent()
             .get(&SCHEDULES)
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
+        val
     }
 
     pub fn get_program_release_history(env: Env) -> Vec<ProgramReleaseHistory> {
-        env.storage()
-            .instance()
+        let val = env.storage()
+            .persistent()
             .get(&RELEASE_HISTORY)
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
+        val
     }
 
     // ========================================================================
@@ -1917,9 +2101,10 @@ impl ProgramEscrowContract {
     ) -> Vec<PayoutRecord> {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         let history = program_data.payout_history;
         let mut results = Vec::new(&env);
         let mut count = 0u32;
@@ -1952,9 +2137,10 @@ impl ProgramEscrowContract {
     ) -> Vec<PayoutRecord> {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         let history = program_data.payout_history;
         let mut results = Vec::new(&env);
         let mut count = 0u32;
@@ -1987,9 +2173,10 @@ impl ProgramEscrowContract {
     ) -> Vec<PayoutRecord> {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         let history = program_data.payout_history;
         let mut results = Vec::new(&env);
         let mut count = 0u32;
@@ -2021,9 +2208,10 @@ impl ProgramEscrowContract {
     ) -> Vec<ProgramReleaseSchedule> {
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let mut results = Vec::new(&env);
         let mut count = 0u32;
         let mut skipped = 0u32;
@@ -2054,9 +2242,10 @@ impl ProgramEscrowContract {
     ) -> Vec<ProgramReleaseSchedule> {
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let mut results = Vec::new(&env);
         let mut count = 0u32;
         let mut skipped = 0u32;
@@ -2087,9 +2276,10 @@ impl ProgramEscrowContract {
     ) -> Vec<ProgramReleaseHistory> {
         let history: Vec<ProgramReleaseHistory> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&RELEASE_HISTORY)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
         let mut results = Vec::new(&env);
         let mut count = 0u32;
         let mut skipped = 0u32;
@@ -2115,14 +2305,16 @@ impl ProgramEscrowContract {
     pub fn get_program_aggregate_stats(env: Env) -> ProgramAggregateStats {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
 
         let mut released_count = 0u32;
         let mut scheduled_count = 0u32;
@@ -2158,9 +2350,10 @@ impl ProgramEscrowContract {
     ) -> Vec<PayoutRecord> {
         let program_data: ProgramData = env
             .storage()
-            .instance()
+            .persistent()
             .get(&PROGRAM_DATA)
             .unwrap_or_else(|| panic!("Program not initialized"));
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
         let history = program_data.payout_history;
         let mut results = Vec::new(&env);
         let mut count = 0u32;
@@ -2187,9 +2380,10 @@ impl ProgramEscrowContract {
     pub fn get_pending_schedules(env: Env) -> Vec<ProgramReleaseSchedule> {
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let mut results = Vec::new(&env);
 
         for i in 0..schedules.len() {
@@ -2205,9 +2399,10 @@ impl ProgramEscrowContract {
     pub fn get_due_schedules(env: Env) -> Vec<ProgramReleaseSchedule> {
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let now = env.ledger().timestamp();
         let mut results = Vec::new(&env);
 
@@ -2224,9 +2419,10 @@ impl ProgramEscrowContract {
     pub fn get_total_scheduled_amount(env: Env) -> i128 {
         let schedules: Vec<ProgramReleaseSchedule> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&SCHEDULES)
             .unwrap_or_else(|| Vec::new(&env));
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         let mut total = 0i128;
 
         for i in 0..schedules.len() {
@@ -2239,7 +2435,8 @@ impl ProgramEscrowContract {
     }
 
     pub fn get_program_count(env: Env) -> u32 {
-        if env.storage().instance().has(&PROGRAM_DATA) {
+        if env.storage().persistent().has(&PROGRAM_DATA) {
+            Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
             1
         } else {
             0
@@ -2248,7 +2445,8 @@ impl ProgramEscrowContract {
 
     pub fn list_programs(env: Env) -> Vec<ProgramData> {
         let mut results = Vec::new(&env);
-        if env.storage().instance().has(&PROGRAM_DATA) {
+        if env.storage().persistent().has(&PROGRAM_DATA) {
+            Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
             results.push_back(Self::get_program_info(env.clone()));
         }
         results
@@ -2304,6 +2502,12 @@ impl ProgramEscrowContract {
                     reentrancy_guard::clear_entered(&env);
                     panic!("Already released");
                 }
+                if Self::is_dispute_open_for_key(&env, &DataKey::Dispute)
+                    || Self::is_schedule_scope_disputed(&env, s.schedule_id, &s.recipient)
+                {
+                    reentrancy_guard::clear_entered(&env);
+                    panic!("Dispute in progress");
+                }
 
                 // Transfer funds
                 let token_client = token::Client::new(&env, &program_data.token_address);
@@ -2340,9 +2544,11 @@ impl ProgramEscrowContract {
             panic!("Schedule not found");
         }
 
-        env.storage().instance().set(&SCHEDULES, &schedules);
+        env.storage().persistent().set(&SCHEDULES, &schedules);
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         // Persist the updated remaining_balance.
-        env.storage().instance().set(&PROGRAM_DATA, &program_data);
+        env.storage().persistent().set(&PROGRAM_DATA, &program_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         // Transfer succeeded — inform the circuit breaker.
         error_recovery::record_success(&env);
@@ -2351,9 +2557,10 @@ impl ProgramEscrowContract {
         if let Some(s) = released_schedule {
             let mut history: Vec<ProgramReleaseHistory> = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&RELEASE_HISTORY)
                 .unwrap_or_else(|| Vec::new(&env));
+            Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
             history.push_back(ProgramReleaseHistory {
                 schedule_id: s.schedule_id,
                 recipient: s.recipient,
@@ -2361,7 +2568,8 @@ impl ProgramEscrowContract {
                 released_at: now,
                 release_type: ReleaseType::Manual,
             });
-            env.storage().instance().set(&RELEASE_HISTORY, &history);
+            env.storage().persistent().set(&RELEASE_HISTORY, &history);
+            Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
         }
 
         // Clear reentrancy guard before returning
@@ -2395,6 +2603,12 @@ impl ProgramEscrowContract {
                 if now < s.release_timestamp {
                     reentrancy_guard::clear_entered(&env);
                     panic!("Not yet due");
+                }
+                if Self::is_dispute_open_for_key(&env, &DataKey::Dispute)
+                    || Self::is_schedule_scope_disputed(&env, s.schedule_id, &s.recipient)
+                {
+                    reentrancy_guard::clear_entered(&env);
+                    panic!("Dispute in progress");
                 }
 
                 // Transfer funds
@@ -2432,9 +2646,11 @@ impl ProgramEscrowContract {
             panic!("Schedule not found");
         }
 
-        env.storage().instance().set(&SCHEDULES, &schedules);
+        env.storage().persistent().set(&SCHEDULES, &schedules);
+        Self::bump_persistent_symbol_ttl(&env, &SCHEDULES);
         // Persist the updated remaining_balance.
-        env.storage().instance().set(&PROGRAM_DATA, &program_data);
+        env.storage().persistent().set(&PROGRAM_DATA, &program_data);
+        Self::bump_persistent_symbol_ttl(&env, &PROGRAM_DATA);
 
         // Transfer succeeded — inform the circuit breaker.
         error_recovery::record_success(&env);
@@ -2443,9 +2659,10 @@ impl ProgramEscrowContract {
         if let Some(s) = released_schedule {
             let mut history: Vec<ProgramReleaseHistory> = env
                 .storage()
-                .instance()
+                .persistent()
                 .get(&RELEASE_HISTORY)
                 .unwrap_or_else(|| Vec::new(&env));
+            Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
             history.push_back(ProgramReleaseHistory {
                 schedule_id: s.schedule_id,
                 recipient: s.recipient,
@@ -2453,7 +2670,8 @@ impl ProgramEscrowContract {
                 released_at: now,
                 release_type: ReleaseType::Automatic,
             });
-            env.storage().instance().set(&RELEASE_HISTORY, &history);
+            env.storage().persistent().set(&RELEASE_HISTORY, &history);
+            Self::bump_persistent_symbol_ttl(&env, &RELEASE_HISTORY);
         }
 
         // Clear reentrancy guard before returning
